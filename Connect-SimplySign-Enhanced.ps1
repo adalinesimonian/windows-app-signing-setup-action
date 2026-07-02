@@ -186,15 +186,136 @@ public class WinAPI {
     public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
     [DllImport("user32.dll")]
     public static extern bool IsWindowVisible(IntPtr hWnd);
-    [DllImport("user32.dll")]
+    [DllImport("user32.dll", SetLastError=true)]
     public static extern bool SetForegroundWindow(IntPtr hWnd);
     [DllImport("user32.dll")]
     public static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")]
     public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+    [DllImport("user32.dll")]
+    public static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
+    [DllImport("user32.dll")]
+    public static extern int GetDlgCtrlID(IntPtr hWnd);
+    [DllImport("user32.dll")]
+    public static extern bool EnumChildWindows(IntPtr hWndParent, EnumWindowsProc lpEnumFunc, IntPtr lParam);
+    [DllImport("user32.dll")]
+    public static extern int GetSystemMetrics(int nIndex);
+    [DllImport("kernel32.dll")]
+    public static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll", SetLastError=true)]
+    public static extern IntPtr GetProcessWindowStation();
+    [DllImport("user32.dll", SetLastError=true)]
+    public static extern IntPtr GetThreadDesktop(uint dwThreadId);
+    [DllImport("user32.dll", SetLastError=true)]
+    public static extern bool GetUserObjectInformation(IntPtr hObj, int nIndex, StringBuilder pvInfo, int nLength, out uint lpnLengthNeeded);
+    [DllImport("user32.dll", EntryPoint="SendMessageW", CharSet=CharSet.Unicode, SetLastError=true)]
+    public static extern IntPtr SendMessageText(IntPtr hWnd, uint Msg, IntPtr wParam, string lParam);
+    [DllImport("user32.dll", EntryPoint="SendMessageW", SetLastError=true)]
+    public static extern IntPtr SendMessageNull(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll", EntryPoint="SendMessageTimeoutW", CharSet=CharSet.Unicode, SetLastError=true)]
+    public static extern IntPtr SendMessageTimeoutText(IntPtr hWnd, uint Msg, IntPtr wParam, string lParam, uint flags, uint timeout, out IntPtr result);
+    [DllImport("user32.dll", SetLastError=true)]
+    public static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
     public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
 
     public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
+
+    public static int TrySetForeground(IntPtr hWnd) {
+        SetForegroundWindow(hWnd);
+
+        return Marshal.GetLastWin32Error();
+    }
+
+    public static string GetClass(IntPtr hWnd) {
+        var sb = new StringBuilder(256);
+
+        GetClassName(hWnd, sb, 256);
+
+        return sb.ToString();
+    }
+
+    public static string GetStationName() {
+        var sb = new StringBuilder(256);
+        uint needed;
+
+        // UOI_NAME = 2
+        GetUserObjectInformation(GetProcessWindowStation(), 2, sb, 256, out needed);
+
+        return sb.ToString();
+    }
+
+    public static string GetDesktopName() {
+        var sb = new StringBuilder(256);
+        uint needed;
+
+        GetUserObjectInformation(GetThreadDesktop(GetCurrentThreadId()), 2, sb, 256, out needed);
+
+        return sb.ToString();
+    }
+
+    public static List<string> DumpChildren(IntPtr parent) {
+        var list = new List<string>();
+
+        EnumChildWindows(parent, (h, l) => {
+            var cls = new StringBuilder(256); GetClassName(h, cls, 256);
+            var txt = new StringBuilder(256); GetWindowText(h, txt, 256);
+            RECT r;
+            GetWindowRect(h, out r);
+
+            list.Add(string.Format("child handle={0} class='{1}' id={2} visible={3} rect=({4},{5},{6},{7}) text='{8}'",
+                h, cls.ToString(), GetDlgCtrlID(h), IsWindowVisible(h),
+                r.Left, r.Top, r.Right, r.Bottom, txt.ToString()));
+
+            return true;
+        }, IntPtr.Zero);
+
+        return list;
+    }
+
+    public struct Ctrl {
+        public IntPtr Handle;
+        public string Class;
+        public string Text;
+        public int Left;
+        public int Top;
+        public int Right;
+        public int Bottom;
+    }
+
+    public static List<Ctrl> GetChildControls(IntPtr parent) {
+        var list = new List<Ctrl>();
+
+        EnumChildWindows(parent, (h, l) => {
+            var cls = new StringBuilder(256); GetClassName(h, cls, 256);
+            var txt = new StringBuilder(256); GetWindowText(h, txt, 256);
+            RECT r;
+            GetWindowRect(h, out r);
+
+            list.Add(new Ctrl { Handle=h, Class=cls.ToString(), Text=txt.ToString(),
+                Left=r.Left, Top=r.Top, Right=r.Right, Bottom=r.Bottom });
+
+            return true;
+        }, IntPtr.Zero);
+
+        return list;
+    }
+
+    public static bool SetControlText(IntPtr hWnd, string text) {
+        IntPtr result;
+        IntPtr ret = SendMessageTimeoutText(
+            hWnd,
+            0x000C, // WM_SETTEXT
+            IntPtr.Zero,
+            text,
+            0x0002, // SMTO_ABORTIFHUNG
+            5000,
+            out result
+        );
+        return ret != IntPtr.Zero;
+    }
+    public static void ClickControl(IntPtr hWnd) {
+        PostMessage(hWnd, 0x00F5 /* BM_CLICK */, IntPtr.Zero, IntPtr.Zero);
+    }
 
     public static List<IntPtr> GetVisibleWindows(uint pid) {
         var list = new List<IntPtr>();
@@ -231,7 +352,7 @@ function Set-WindowFocus {
     )
 
     for ($i = 1; $i -le $MaxAttempts; $i++) {
-        [WinAPI]::SetForegroundWindow($Handle) | Out-Null
+        $err = [WinAPI]::TrySetForeground($Handle)
         Start-Sleep -Milliseconds $DelayMs
 
         $foreground = [WinAPI]::GetForegroundWindow()
@@ -241,7 +362,8 @@ function Set-WindowFocus {
             return $true
         }
 
-        Write-Host "Focus attempt $i of $MaxAttempts failed, retrying..."
+        $fgClass = if ($foreground -eq [IntPtr]::Zero) { "<none>" } else { [WinAPI]::GetClass($foreground) }
+        Write-Host "Focus attempt $i of $MaxAttempts failed (SetForegroundWindow lastError=$err, foreground=$foreground class='$fgClass'), retrying..."
     }
 
     return $false
@@ -374,11 +496,54 @@ function Get-RecoveryTotpCode {
     return $code
 }
 
+function Get-LoginControls {
+    param([IntPtr]$Handle)
+
+    $ctrls = [WinAPI]::GetChildControls($Handle)
+    $edits = @($ctrls | Where-Object { $_.Class -like '*EDIT*' } | Sort-Object Top)
+    $ok = $ctrls | Where-Object {
+        $_.Class -like '*BUTTON*' -and ($_.Text -replace '&', '') -ieq 'Ok'
+    } | Select-Object -First 1
+
+    [PSCustomObject]@{
+        Id    = if ($edits.Count -ge 1) { $edits[0].Handle } else { [IntPtr]::Zero }
+        Token = if ($edits.Count -ge 2) { $edits[1].Handle } else { [IntPtr]::Zero }
+        Ok    = if ($ok) { $ok.Handle } else { [IntPtr]::Zero }
+        EditCount = $edits.Count
+    }
+}
+
+function Invoke-CredentialSubmit {
+    param([IntPtr]$Handle, [string]$Otp)
+
+    $c = Get-LoginControls -Handle $Handle
+
+    if ($c.EditCount -lt 2 -or $c.Ok -eq [IntPtr]::Zero) {
+        Write-Host "WARNING: expected 2 EDIT controls and an Ok button. Instead found EditCount=$($c.EditCount), Ok=$($c.Ok). Falling back to keystroke injection."
+        Invoke-CredentialSubmitKeys -Handle $Handle -Otp $Otp
+        return
+    }
+
+    Write-Host "  set ID field..."
+    $idOk = [WinAPI]::SetControlText($c.Id, $UserId)
+    Write-Host "  set ID field done (completed=$idOk)"
+
+    Write-Host "  set Token field..."
+    $tokOk = [WinAPI]::SetControlText($c.Token, $Otp)
+    Write-Host "  set Token field done (completed=$tokOk)"
+    Start-Sleep -Milliseconds 200
+    Write-Host "  click Ok..."
+    [WinAPI]::ClickControl($c.Ok)
+    Write-Host "  click Ok posted"
+    $script:lastSubmitPeriod = Get-TotpPeriod
+    Start-Sleep -Milliseconds 300
+}
+
 # Enter credentials via the clipboard (Ctrl+V) instead of streaming keystrokes.
 # SendKeys on Qt fields intermittently drops/reorders characters (a single lost
 # digit => "Invalid user name or token"); an atomic paste removes that failure
 # class. Fields are cleared first to drop any pre-filled/residual content.
-function Invoke-CredentialSubmit {
+function Invoke-CredentialSubmitKeys {
     param([IntPtr]$Handle, [string]$Otp)
 
     if (-not (Set-WindowFocus -Handle $Handle)) {
@@ -425,26 +590,39 @@ function Invoke-CredentialSubmit {
 # already-focused Token field and submit — no window re-focus and no Tab (either
 # would move input off the Token field).
 function Invoke-TokenResubmit {
-    param([string]$Otp)
+    param([IntPtr]$Handle, [string]$Otp)
 
     # Diagnostic: dialog state before the token-only resubmit (where is focus,
     # does the ID field still hold its value?).
     Save-Screenshot -Stage "before-token-resubmit"
 
-    Set-Clipboard -Value $Otp
-    $wshell.SendKeys("^a"); Start-Sleep -Milliseconds 120
-    $wshell.SendKeys("{DEL}"); Start-Sleep -Milliseconds 120
-    $wshell.SendKeys("^v"); Start-Sleep -Milliseconds 250
+    $c = Get-LoginControls -Handle $Handle
+    if ($c.Token -ne [IntPtr]::Zero -and $c.Ok -ne [IntPtr]::Zero) {
+        [void][WinAPI]::SetControlText($c.Token, $Otp)
+        Start-Sleep -Milliseconds 200
+        [WinAPI]::ClickControl($c.Ok)
+    } else {
+        Write-Host "WARNING: Couldn't find token/Ok control. Using keystroke fallback."
 
-    $wshell.SendKeys("{ENTER}")
+        if (-not (Set-WindowFocus -Handle $Handle)) {
+            Write-Host "WARNING: Couldn't focus login dialog before resubmitting token."
+        }
+
+        Set-Clipboard -Value $Otp
+
+        $wshell.SendKeys("^a"); Start-Sleep -Milliseconds 120
+        $wshell.SendKeys("{DEL}"); Start-Sleep -Milliseconds 120
+        $wshell.SendKeys("^v"); Start-Sleep -Milliseconds 250
+        $wshell.SendKeys("{ENTER}")
+
+        Set-Clipboard -Value ' '
+    }
+
     $script:lastSubmitPeriod = Get-TotpPeriod
     Start-Sleep -Milliseconds 300
 
     # Diagnostic: result right after the token-only resubmit.
     Save-Screenshot -Stage "after-token-resubmit"
-
-    # Clear the clipboard so the secret token does not linger
-    Set-Clipboard -Value ' '
 }
 
 # Dismiss a modal popup (update "New version" dialog OR "Invalid user name or
@@ -468,6 +646,27 @@ function Resolve-Popup {
     $guess = if ($g.Width -ge 400) { 'likely #2 update dialog (Yes/No)' } else { 'likely #3 error dialog (OK only)' }
     Write-Host "Modal popup detected: handle=$popup title='$(Get-WindowTitle -Handle $popup)' size=$($g.Width)x$($g.Height) pos=($($g.Left),$($g.Top)) — $guess"
     Save-Screenshot -Stage "popup"
+
+    # Click the button HWND on the window for No or OK, not "Yes" which starts
+    # an update.
+    $btns = @([WinAPI]::GetChildControls($popup) | Where-Object { $_.Class -like '*BUTTON*' })
+    $target = $btns | Where-Object { ($_.Text -replace '&', '') -imatch '^(No|OK)$' } | Select-Object -First 1
+    if ($target) {
+        Write-Host "Trying to dismiss by doing a BM_CLICK on '$($target.Text)'"
+        [WinAPI]::ClickControl($target.Handle)
+        Start-Sleep -Milliseconds 800
+
+        $remaining = @(Get-SimplySignWindows | Where-Object { $_ -ne $LoginHandle })
+
+        if ($remaining.Count -eq 0) {
+            Write-Host "Popup dismissed via BM_CLICK on '$($target.Text)'"
+            Set-DialogHandledFlag
+
+            return $true
+        }
+
+        $popup = $remaining[0]
+    }
 
     $ladder = @(
         @{ Keys = '%n';      Desc = 'Alt+N (No)' },
@@ -531,7 +730,7 @@ $loginHandle = Get-LoginWindow -Windows $windows
 Write-Host "Login window: handle=$loginHandle title='$(Get-WindowTitle -Handle $loginHandle)'"
 
 if (-not (Set-WindowFocus -Handle $loginHandle)) {
-    Stop-Processing "Could not focus login dialog for credential injection"
+    Write-Host "Couldn't focus login dialog. Trying injection using messages."
 }
 # Small delay to ensure window is ready for input
 Start-Sleep -Seconds 2
@@ -559,7 +758,7 @@ if ($forceBad) {
     $submitOtp = $otp
 }
 
-Write-Host "Injecting credentials (clipboard paste): ID -> TAB -> Token -> ENTER..."
+Write-Host "Injecting credentials (WM_SETTEXT): ID and Token -> BM_CLICK Ok..."
 Invoke-CredentialSubmit -Handle $loginHandle -Otp $submitOtp
 Write-Host "Credentials submitted"
 Write-Host ""
@@ -613,7 +812,7 @@ while ($elapsed -lt $maxWaitSeconds) {
             Start-Sleep -Milliseconds 500
             $freshOtp = Get-RecoveryTotpCode
             Write-Host "Re-submitting a fresh-period token into the focused Token field..."
-            Invoke-TokenResubmit -Otp $freshOtp
+            Invoke-TokenResubmit -Handle $loginHandle -Otp $freshOtp
         }
         Write-Host ""
     }
